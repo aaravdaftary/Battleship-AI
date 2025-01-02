@@ -4,8 +4,10 @@ import numpy as np
 import pickle
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 import torch.optim as optim
-import copy
+import math
+from torch.utils.tensorboard import SummaryWriter
 
 ships = {
     'D' : 2,
@@ -261,6 +263,7 @@ class ai:
             return False
 
     def giveResponse(self, r, c):
+        # . _ * A B C D S
         if(self.myBoard[r][c] == '.'):
             return self.myBoard[r][c]
         else:
@@ -292,6 +295,8 @@ class game:
     def __init__(self):
         self.probAi = ai()
         self.rlAi = ai()
+
+        self.turns = 0
     
     def reset(self):
         del self.probAi
@@ -299,6 +304,7 @@ class game:
 
         self.probAi = ai()
         self.rlAi = ai()
+        self.turns = 0
 
         self.probAi.placeShips()
         self.rlAi.placeShips()
@@ -307,70 +313,76 @@ class game:
     
     def convertBoard(self):
 
-        characters = ['.', '_', '*', 'A', 'B', 'C', 'D', 'S']
+        characters = {
+            '.': 1.0/128,
+            '_': 2.0/128,
+            '*': 4.0/128,
+            'A': 8.0/128,
+            'B': 16.0/128,
+            'C': 32.0/128,
+            'D': 64.0/128,
+            'S': 128.0/128
+        }
 
+        """
         myboard = []
         for i in range(10):
             line = []
             for j in range(10):
                 line.append(characters.index(self.rlAi.myBoard[i][j]))
             myboard.append(line)
+        """
         
         yourboard = []
         for i in range(10):
             line = []
             for j in range(10):
-                line.append(characters.index(self.rlAi.yourBoard[i][j]))
+                line.append(characters[self.rlAi.yourBoard[i][j]])
             yourboard.append(line)
         
-        return myboard, yourboard
+        return yourboard
 
-
-    def step(self, r, c):
+    def step(self, r, c, oldRew):
         # 5 possibilities for reward/punishment:
         # Hit: 1, Miss: -1, Sink: A:2, B: 3, C: 4, D: 5, S: 4, Win: 17, Lose: -17
 
-        shipVals = {
-            'D' : 5,
-            'C' : 4,
-            'S' : 4,
-            'B' : 3,
-            'A' : 2
-        }
         done = False
+
+        self.turns += 1
 
         resp = self.probAi.giveResponse(r, c)
 
         #print("RlAi hit:", r, c, resp)
 
         if(resp == '.'):
-            reward = -1
-        elif(resp == '*'):
-            reward = 1
-        elif(resp == '_'):
-            reward = -100
-        elif(resp in shipVals):
-            reward = shipVals[resp]
+            reward = -0.5
+        else:
+            if(oldRew > 0):
+                reward = oldRew * 1.1
+            else:
+                reward = 1
 
         if(self.rlAi.updateStatus(resp, r, c, False)):
-            reward = 17
+
+            """
+            reward = 80 - self.turns
+
+            if(reward >= 0):
+                reward += 17
+            else:
+                reward -= 17
+            """
+
             done = True
-        else:
-            r, c = self.probAi.probCalculate()
-            resp = self.rlAi.giveResponse(r, c)
-            #print("ProbAi hit:", r, c, resp)
-            if(self.probAi.updateStatus(resp, r, c, True)):
-                reward = -17
-                done = True
 
-        myboard, yourboard = self.convertBoard()
+        yourboard = self.convertBoard()
 
-        return myboard, yourboard, done, reward
+        return yourboard, done, reward
 
     def render(self):
         self.rlAi.printBoard()
-        print('-'*10)
-        self.probAi.printBoard()
+        #print('-'*10)
+        #self.probAi.printBoard()
         print('='*20)
 
 #---------------
@@ -379,16 +391,36 @@ class policyNetwork(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(policyNetwork, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fcx = nn.Linear(hidden_size, output_size)
         self.fcy = nn.Linear(hidden_size, output_size)
 
+        torch.nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity='relu')  # Xavier uniform for weights
+        init.zeros_(self.fc1.bias)
+
+        torch.nn.init.kaiming_uniform_(self.fc2.weight, nonlinearity='relu')  # Xavier uniform for weights
+        init.zeros_(self.fc2.bias)
+
+        torch.nn.init.kaiming_uniform_(self.fcx.weight, nonlinearity='relu')  # Xavier uniform for weights
+        init.zeros_(self.fcx.bias)
+
+        torch.nn.init.kaiming_uniform_(self.fcy.weight, nonlinearity='relu')  # Xavier uniform for weights
+        init.zeros_(self.fcy.bias)
+
+        #if(torch.isnan(self.fc1.weight).any()):
+        #    pass
+
     def forward(self, x):
-        logits = torch.relu(self.fc1(x))
-        logitx = torch.relu(self.fcx(logits))
-        logity = torch.relu(self.fcy(logits))
+        logits = torch.nn.functional.leaky_relu(self.fc1(x))
+        #if(any(math.isnan(x) for x in logits)):
+        #    pass
+        logits = torch.nn.functional.leaky_relu(self.fc2(logits))
+        logitx = torch.nn.functional.leaky_relu(self.fcx(logits))
+        logity = torch.nn.functional.leaky_relu(self.fcy(logits))
 
         xprob = torch.softmax(logitx, dim = -1)
         yprob = torch.softmax(logity, dim = -1)
+
         return xprob, yprob
 
 """
@@ -415,47 +447,67 @@ def findAction(r, c):
     return x, y
 """
 
+def actionTaken(xProb, yProb, maskGrid):
+    for i in range(10):
+        for j in range(10):
+            if(maskGrid[i][j] != 0):
+                maskGrid[i][j] = (xProb[i].item()*yProb[j].item())
+    
+    action = torch.multinomial(torch.tensor(maskGrid).view(-1), 1).item()
+    
+    r = action // 10
+    c = action % 10
+
+    maskGrid[r][c] = 0
+
+    return r, c
+
 def init_training():
 
-    H = 200  # number of hidden layer neurons
     batch_size = 10  # every how many episodes to do a param update?
-    learning_rate = 1e-4
     gamma = 0.99  # discount factor for reward
-    decay_rate = 0.99  # decay factor for RMSProp leaky sum of grad^2
     resume = False  # resume from previous checkpoint?
     render = False
 
     # Model initialization
-    D = 10 * 10 * 2  # input dimensionality: 80x80 grid
-
-    model = policyNetwork(D, H, 10)  # 1 output for probability of action 2
-    optimizer = optim.RMSprop(model.parameters(), lr=learning_rate, alpha=decay_rate)
+    model = policyNetwork(input_size=100, hidden_size=200, output_size=10)  # 1 output for probability of action 2
+    optimizer = optim.RMSprop(model.parameters(), lr=1e-6, alpha=0.99, eps=1e-7)
+    #optimizer = optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-7)
 
     env = game()
 
     lossTot = []
+    rewardTot = []
+    stepTot = []
     epi = 1
 
-    f = open("C:/Users/aarav/demofile2.txt", "a")
+    f = open("./loss.txt", "w")
+
+    writer = SummaryWriter('runs/OnePlayer')
+
+    runningLoss = 0.0
 
     while(True):
-        myB, yrB = env.reset()
+        yrB = env.reset()
         rewards, logProbXs, logProbYs = [], [], []
         done = False
         startTime = currentMilliTime()
+        maskGrid = np.ones((10, 10))
+        reward = -1
         if(render):
             env.render()
         while not done:
 
             # Preprocess the observation
-            x = torch.tensor(np.vstack((myB, yrB)).ravel(), dtype=torch.float32)
+            x = torch.tensor(np.vstack(yrB).ravel(), dtype=torch.float32)
 
             # Forward the policy network and sample an action
             xprob, yprob = model(x)
             
             # log_prob = policy_network(state).log_prob(action)
 
-            r, c = torch.multinomial(xprob, 1).item(), torch.multinomial(yprob, 1).item()
+            #r, c = torch.multinomial(xprob, 1).item(), torch.multinomial(yprob, 1).item()
+            r, c = actionTaken(xprob, yprob, maskGrid)
 
             logProbX = torch.log(xprob[r])
             logProbY = torch.log(yprob[c])
@@ -463,19 +515,25 @@ def init_training():
             #x, y = findAction(r, c) # "fake label"
 
             # Step the environment
-            myB, yrB, done, reward = env.step(r, c)
+            yrB, done, reward = env.step(r, c, reward)
             rewards.append(reward)
             logProbXs.append(logProbX)
             logProbYs.append(logProbY)
             
             #loss = - log_prob * reward
             if(render):
+                print(len(rewards))
                 env.render()
 
         
         # Stack together all inputs, action gradients, and rewards for this episode
         # rewards -= np.mean(rewards)
-        rewards /= np.std(rewards)
+        #print(len(rewards), rewards)
+
+        rewardTot.append(sum(rewards))
+        stepTot.append(len(rewards))
+
+        rewards = (rewards - np.mean(rewards))/np.std(rewards)
 
         epr = torch.tensor(rewards, dtype=torch.float32)
 
@@ -488,12 +546,22 @@ def init_training():
         lossX = logProbXs * epr * -1
         lossY = logProbYs * epr * -1
         loss = (lossX + lossY).mean()
-        lossTot.append(-(loss.item()))
 
-        if(epi % 1000 == 0):
-            pickle.dump(model, open('save.p', 'wb'))
-            f.write("%s, %s, %s\n" % (str(epi), str(loss), str(currentMilliTime()-startTime)))
+        lossTot.append(loss.item())
+
+        if(epi % 100 == 0):
+            pickle.dump(model, open('model.p', 'wb'))
+            writer.add_scalar('loss_100epi', sum(lossTot)/100, epi, currentMilliTime()/1000)
+            writer.add_scalar('reward_100epi', sum(rewardTot)/100, epi, currentMilliTime()/1000)
+            writer.add_scalar('step_100epi', sum(stepTot)/100, epi, currentMilliTime()/1000)
+
+            f.write("%5d %s, %s, %s\n" % (epi, str(sum(lossTot)/100), str(sum(rewardTot)/100), str(sum(stepTot)/100)))
+            f.flush()
+
+            lossTot, rewardTot, stepTot = [], [], []
             #print(epi, loss, currentMilliTime()-startTime)
+        
+        #print(epi, logProbXs, logProbYs, rewards, loss, currentMilliTime()-startTime)
 
         #for name, param in model.named_parameters():
         #    print(f"Parameter: {name}, Value: {param.data}")
@@ -501,6 +569,7 @@ def init_training():
         # Backpropagation
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         epi += 1
